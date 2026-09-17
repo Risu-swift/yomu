@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(query) = &args.probe {
-        return cli::probe(query, &registry, &picker).await;
+        return cli::probe(query, args.source.as_deref(), &registry, &picker).await;
     }
 
     let terminal = ratatui::init();

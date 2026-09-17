@@ -16,6 +16,8 @@ pub struct Args {
     pub protocol: Option<ProtocolType>,
     pub font_size: Option<(u16, u16)>,
     pub probe: Option<String>,
+    /// Restrict --probe to sources whose name contains this.
+    pub source: Option<String>,
     pub bench: bool,
     pub help: bool,
 }
@@ -35,6 +37,8 @@ OPTIONS:
                          (env: YOMU_FONT_SIZE)
     --probe [QUERY]      run search, chapter and page lookups against every
                          source and print what came back, then exit. No TUI.
+    --source <NAME>      limit --probe to sources matching NAME, so one site
+                         can be checked without querying all of them.
     -h, --help           show this help
 
 NOTES:
@@ -79,6 +83,7 @@ impl Args {
                 "--protocol" => args.protocol = it.next().as_deref().and_then(parse_protocol),
                 "--font-size" => args.font_size = it.next().as_deref().and_then(parse_font_size),
                 "--bench" => args.bench = true,
+                "--source" => args.source = it.next(),
                 "--probe" => {
                     // The query is optional; without one the source browses.
                     args.probe = Some(it.next().unwrap_or_default());
@@ -251,7 +256,12 @@ pub fn bench(picker: &Picker) {
 }
 
 /// Exercise every source end to end and print what came back.
-pub async fn probe(query: &str, registry: &Registry, picker: &Picker) -> Result<()> {
+pub async fn probe(
+    query: &str,
+    only: Option<&str>,
+    registry: &Registry,
+    picker: &Picker,
+) -> Result<()> {
     let font = picker.font_size();
     println!(
         "protocol: {:?}   cell size: {}x{}px",
@@ -271,7 +281,14 @@ pub async fn probe(query: &str, registry: &Registry, picker: &Picker) -> Result<
         }
     }
 
+    let wanted = only.map(|s| s.to_lowercase());
     for src in &registry.sources {
+        // Checking one site should not mean querying every configured one.
+        if let Some(want) = &wanted {
+            if !src.name().to_lowercase().contains(want.as_str()) {
+                continue;
+            }
+        }
         println!("\n=== {} ===", src.name());
 
         let results = match src.search(query).await {

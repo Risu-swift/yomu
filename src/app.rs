@@ -23,8 +23,12 @@ use crate::state::{Progress, State};
 pub enum Msg {
     Results(Vec<MangaRef>),
     Chapters(String, Chapters),
-    Pages(String, Vec<Page>),
-    Image(usize, Arc<DynamicImage>),
+    /// Pages for one chapter: its index, and whether to continue the current
+    /// read or replace it.
+    Pages(String, usize, Vec<Page>, bool),
+    /// A decoded page: the page-list epoch it was requested under, its
+    /// index, and the image.
+    Image(u64, usize, Arc<DynamicImage>),
     Cover(String, Arc<DynamicImage>),
     Error(String),
     /// A finished reader frame, tagged with the generation that asked for it.
@@ -313,11 +317,13 @@ impl App {
         });
     }
 
-    fn load_pages(&mut self) {
+    /// Fetch one chapter's pages. `append` continues the current read rather
+    /// than replacing it, which is how strip mode runs past a chapter end.
+    fn load_pages(&mut self, chapter_idx: usize, append: bool) {
         let Some(reader) = &self.reader else { return };
         let (Some(src), Some(chapter)) = (
             self.registry.get(&reader.manga.source),
-            reader.chapter_ref().cloned(),
+            reader.chapters.get(chapter_idx).cloned(),
         ) else {
             return;
         };
@@ -325,15 +331,29 @@ impl App {
         let key = manga.key();
         let tx = self.tx.clone();
         self.busy = true;
-        self.inflight_pages.clear();
+        if !append {
+            // Appending keeps reading from the pages already in flight.
+            self.inflight_pages.clear();
+        }
 
         tokio::spawn(async move {
             let msg = match src.pages(&manga, &chapter).await {
-                Ok(p) => Msg::Pages(key, p),
+                Ok(p) => Msg::Pages(key, chapter_idx, p, append),
                 Err(e) => Msg::Error(format!("page list failed: {e:#}")),
             };
             let _ = tx.send(msg);
         });
+    }
+
+    /// Queue the following chapter once the end of the loaded pages is close.
+    fn maybe_load_next_chapter(&mut self) {
+        let Some(next) = self.reader.as_ref().and_then(|r| r.next_chapter_to_load()) else {
+            return;
+        };
+        if let Some(reader) = self.reader.as_mut() {
+            reader.pending_chapter = true;
+        }
+        self.load_pages(next, true);
     }
 
     /// Kick off downloads for whatever the reader wants next.
@@ -345,6 +365,7 @@ impl App {
             .filter(|i| !self.inflight_pages.contains(i))
             .collect();
 
+        let epoch = reader.epoch;
         for idx in wanted {
             let Some(page) = reader.pages.get(idx).cloned() else {
                 continue;
@@ -363,7 +384,7 @@ impl App {
                 // Decoding a 4MB PNG blocks for long enough to stutter the UI.
                 match tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await {
                     Ok(Ok(img)) => {
-                        let _ = tx.send(Msg::Image(idx, Arc::new(img)));
+                        let _ = tx.send(Msg::Image(epoch, idx, Arc::new(img)));
                     }
                     Ok(Err(e)) => {
                         let _ = tx.send(Msg::Error(format!("decode page {}: {e}", idx + 1)));
@@ -452,6 +473,7 @@ impl App {
     /// Driven from the event loop using the rectangles the last draw recorded,
     /// so the layout stays defined in one place.
     pub fn refresh_images(&mut self) {
+        self.maybe_load_next_chapter();
         self.refresh_reader_image();
         self.refresh_cover_image();
     }
@@ -546,33 +568,50 @@ impl App {
                     }
                 }
             }
-            Msg::Pages(key, pages) => {
+            Msg::Pages(key, chapter_idx, pages, append) => {
                 self.busy = false;
                 if let Some(reader) = &mut self.reader {
                     if reader.manga.key() == key {
                         let n = pages.len();
-                        reader.set_pages(pages);
 
-                        // Restore the exact spot inside this chapter, if we have one.
-                        if let Some(p) = self.state.progress.get(&key) {
-                            if reader.chapter_ref().map(|c| c.id.as_str()) == Some(p.chapter_id.as_str())
-                                && p.page < n
-                            {
-                                reader.idx = p.page;
-                                reader.offset = p.offset;
-                                reader.invalidate();
+                        if append {
+                            // The view stays exactly where it is; the page list
+                            // just gets longer underneath it.
+                            reader.append_pages(chapter_idx, pages);
+                            self.status = match reader.chapters.get(chapter_idx) {
+                                Some(c) => format!("continuing into {}", c.label()),
+                                None => format!("+{n} pages"),
+                            };
+                        } else {
+                            reader.set_pages(chapter_idx, pages);
+
+                            // Restore the exact spot inside this chapter.
+                            if let Some(p) = self.state.progress.get(&key) {
+                                if reader.chapter_ref().map(|c| c.id.as_str())
+                                    == Some(p.chapter_id.as_str())
+                                    && p.page < n
+                                {
+                                    reader.idx = p.page;
+                                    reader.offset = p.offset;
+                                    reader.invalidate();
+                                }
                             }
+                            self.status = format!("{n} pages");
                         }
-                        self.status = format!("{n} pages");
                         self.prefetch();
                     }
                 }
             }
-            Msg::Image(idx, img) => {
+            Msg::Image(epoch, idx, img) => {
                 self.inflight_pages.remove(&idx);
                 if let Some(reader) = &mut self.reader {
-                    reader.insert_image(idx, img);
-                    reader.evict();
+                    // A download started before the page list was replaced now
+                    // refers to a different page, so it is dropped rather than
+                    // written into whatever occupies that index.
+                    if reader.epoch == epoch {
+                        reader.insert_image(idx, img);
+                        reader.evict();
+                    }
                 }
                 self.prefetch();
             }
@@ -807,9 +846,10 @@ impl App {
             Direction::Vertical => ViewMode::Strip,
             _ => ViewMode::Paged,
         };
+        let chapter = reader.chapter;
         self.reader = Some(reader);
         self.screen = Screen::Reader;
-        self.load_pages();
+        self.load_pages(chapter, false);
     }
 
     fn reader_key(&mut self, key: KeyEvent) {
@@ -898,9 +938,9 @@ impl App {
             self.status = "no more chapters".into();
             return;
         }
-        reader.chapter = next as usize;
-        reader.set_pages(Vec::new());
-        self.load_pages();
+        // An explicit jump replaces the read rather than continuing it, so the
+        // appended chapters go away and the new one starts from the top.
+        self.load_pages(next as usize, false);
     }
 
     fn save_progress(&mut self) {

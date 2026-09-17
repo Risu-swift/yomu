@@ -204,6 +204,10 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     // Recorded so the event loop can encode for this exact size after the draw.
     app.cover_area = cover_area;
 
+    // Same reason as the reader: covers differ in aspect, so a taller one
+    // leaves strips of the previous cover behind without this.
+    f.render_widget(Block::new().style(Style::new().bg(BG)), cover_area);
+
     if let Some(protocol) = &app.cover_protocol {
         f.render_widget(Image::new(protocol), cover_area);
     } else {
@@ -334,10 +338,20 @@ fn reader(f: &mut Frame, app: &mut App) {
         Some(c) => format!("{} · {}", reader.manga.title, c.label()),
         None => reader.manga.title.clone(),
     };
-    let pages = reader.pages.len();
-    let idx = reader.idx;
+    // Chapter-relative: a continuous read appends chapters onto the page list,
+    // so a raw index would climb past the end of the chapter being read.
+    let (page, pages) = reader.chapter_span();
+    let waiting = reader.waiting_for_pages();
     let mode = reader.mode.label();
     let fraction = reader.fraction();
+
+    // Paint the pane first. The encoder no longer erases before drawing, so a
+    // cell the new image does not reach keeps showing the previous one —
+    // visible as a strip down the side when rounding to whole cells leaves the
+    // image slightly smaller than the pane. Filling here makes ratatui's own
+    // diff repaint exactly those cells, and leaves the image's own cells alone
+    // because the protocol marks them as skipped.
+    f.render_widget(Block::new().style(Style::new().bg(BG)), body);
 
     // The previous frame stays on screen while the next one encodes, which is
     // what keeps scrolling from flickering.
@@ -377,7 +391,14 @@ fn reader(f: &mut Frame, app: &mut App) {
             .filled_style(Style::new().fg(ACCENT))
             .unfilled_style(Style::new().fg(BORDER))
             .label(Span::styled(
-                format!(" {}/{} · {mode} ", (idx + 1).min(pages.max(1)), pages.max(1)),
+                format!(
+                    " {}/{} · {mode}{} ",
+                    (page + 1).min(pages.max(1)),
+                    pages.max(1),
+                    // Scrolling stops at the last page that has arrived, so say
+                    // so rather than letting it look frozen.
+                    if waiting { " · loading" } else { "" },
+                ),
                 Style::new().fg(MUTED),
             ))
             .ratio(fraction),

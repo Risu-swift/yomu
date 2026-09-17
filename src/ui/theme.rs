@@ -2,6 +2,10 @@
 
 use ratatui::style::Color;
 
+/// Fill behind images. Matches the `background_color` given to the picker, so
+/// the letterbox padding inside an image and the cells around it agree.
+pub const BG: Color = Color::Rgb(22, 22, 30);
+
 pub const ACCENT: Color = Color::Rgb(122, 162, 247);
 pub const ACCENT2: Color = Color::Rgb(187, 154, 247);
 pub const TEXT: Color = Color::Rgb(205, 214, 244);
