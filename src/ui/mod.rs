@@ -509,11 +509,16 @@ fn settings(f: &mut Frame, app: &mut App) {
                 "Show adult content".to_string(),
                 "applies only to sources that carry a rating".to_string(),
             ),
+            SettingItem::TrimMargins => (
+                app.state.trim_margins,
+                "Trim page margins".to_string(),
+                "crops uniform borders so more of the pane is artwork".to_string(),
+            ),
             SettingItem::Source(name) => {
                 let supports = app
                     .registry
                     .sources
-                    .get(i.saturating_sub(1))
+                    .get(i.saturating_sub(2))
                     .is_some_and(|s| s.supports_nsfw_filter());
                 (
                     app.is_enabled(name),
@@ -613,6 +618,8 @@ fn help(f: &mut Frame, app: &App) {
         key_line("space b", "page down / up"),
         key_line("n p", "next / previous chapter"),
         key_line("v", "toggle paged ↔ strip view"),
+        key_line("d", "dim the page for night reading"),
+        key_line("t", "trim page margins on/off"),
         key_line("f", "reader bars: full ↔ compact ↔ hidden"),
         key_line(",", "settings"),
         key_line("esc", "back · q quit"),

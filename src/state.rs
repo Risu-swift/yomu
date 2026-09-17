@@ -77,10 +77,25 @@ pub struct State {
     /// plugins being added, removed or reordered.
     #[serde(default)]
     pub disabled_sources: Vec<String>,
+    /// Crop uniform borders off pages. On by default: the margin is dead
+    /// space and the page is scaled up to the same pane without it.
+    #[serde(default = "yes")]
+    pub trim_margins: bool,
+    /// Percentage brightness for pages, 100 being untouched.
+    #[serde(default = "full_brightness")]
+    pub brightness: u8,
     /// How much chrome the reader draws. Remembered between sessions, since it
     /// is a reading preference rather than a per-session choice.
     #[serde(default)]
     pub chrome: Chrome,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn full_brightness() -> u8 {
+    100
 }
 
 fn path() -> PathBuf {

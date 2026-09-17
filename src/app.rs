@@ -54,6 +54,7 @@ pub enum Screen {
 /// One row on the settings screen.
 pub enum SettingItem {
     AllowNsfw,
+    TrimMargins,
     /// A source, toggled on or off by name.
     Source(String),
 }
@@ -339,7 +340,7 @@ impl App {
     }
 
     pub fn settings_items(&self) -> Vec<SettingItem> {
-        let mut items = vec![SettingItem::AllowNsfw];
+        let mut items = vec![SettingItem::AllowNsfw, SettingItem::TrimMargins];
         items.extend(self.registry.names().into_iter().map(SettingItem::Source));
         items
     }
@@ -855,6 +856,7 @@ impl App {
                 self.results.clear();
                 self.search();
             }
+            SettingItem::TrimMargins => self.toggle_trim(),
             SettingItem::Source(name) => {
                 if let Some(i) = self.state.disabled_sources.iter().position(|d| *d == name) {
                     self.state.disabled_sources.remove(i);
@@ -1007,6 +1009,9 @@ impl App {
             _ => ViewMode::Paged,
         };
         let chapter = reader.chapter;
+        reader.trim_margins = self.state.trim_margins;
+        reader.brightness = self.state.brightness;
+
         self.reader = Some(reader);
         self.screen = Screen::Reader;
         self.load_pages(chapter, false);
@@ -1028,6 +1033,8 @@ impl App {
                 self.refresh_cover_proto();
             }
             KeyCode::Char('v') => reader.toggle_mode(),
+            KeyCode::Char('d') => self.cycle_brightness(),
+            KeyCode::Char('t') => self.toggle_trim(),
             KeyCode::Char('f') => {
                 // Fewer bars means more rows of artwork, so this is worth
                 // having on a key rather than fixed.
@@ -1068,14 +1075,16 @@ impl App {
                     }
                     KeyCode::Char(' ') | KeyCode::PageDown => {
                         if strip {
-                            reader.scroll(600);
+                            let step = reader.page_step();
+                            reader.scroll(step);
                         } else {
                             reader.next_page();
                         }
                     }
                     KeyCode::Char('b') | KeyCode::PageUp => {
                         if strip {
-                            reader.scroll(-600);
+                            let step = reader.page_step();
+                            reader.scroll(-step);
                         } else {
                             reader.prev_page();
                         }
@@ -1100,6 +1109,46 @@ impl App {
                 self.save_progress();
             }
         }
+    }
+
+
+    /// Step the page brightness down and wrap, for reading in the dark.
+    fn cycle_brightness(&mut self) {
+        self.state.brightness = match self.state.brightness {
+            100 => 85,
+            85 => 70,
+            70 => 55,
+            _ => 100,
+        };
+        self.state.save();
+        self.status = format!("brightness {}%", self.state.brightness);
+
+        if let Some(reader) = self.reader.as_mut() {
+            reader.brightness = self.state.brightness;
+            reader.invalidate();
+        }
+    }
+
+    /// Turn margin trimming on or off.
+    ///
+    /// Trimming happens when a page is decoded, so the cached images have to go
+    /// and be fetched again. They come back from the on-disk cache rather than
+    /// the network, so this is cheap.
+    fn toggle_trim(&mut self) {
+        self.state.trim_margins = !self.state.trim_margins;
+        self.state.save();
+        self.status = if self.state.trim_margins {
+            "margins trimmed".into()
+        } else {
+            "margins kept".into()
+        };
+
+        if let Some(reader) = self.reader.as_mut() {
+            reader.trim_margins = self.state.trim_margins;
+            reader.drop_images();
+        }
+        self.inflight_pages.clear();
+        self.prefetch();
     }
 
     fn change_chapter(&mut self, delta: i64) {

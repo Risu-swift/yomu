@@ -49,6 +49,82 @@ struct ViewKey {
 }
 
 
+
+/// Scale every channel, for reading in the dark.
+fn dim(image: &mut image::RgbImage, percent: u8) {
+    if percent >= 100 {
+        return;
+    }
+    let factor = percent as u32;
+    for pixel in image.pixels_mut() {
+        for channel in pixel.0.iter_mut() {
+            *channel = ((*channel as u32 * factor) / 100) as u8;
+        }
+    }
+}
+
+/// Crop a uniform border off a page.
+///
+/// Scans carry anywhere from nothing to a tenth of their area in blank margin.
+/// Trimming it is the cheapest way to put more artwork on screen, since the
+/// page is then scaled up to the same pane. Conservative on purpose: a border
+/// has to be genuinely uniform to count, and no more than a sixth of a side is
+/// ever removed, so a page that is legitimately pale at one edge survives.
+fn trim(image: &DynamicImage) -> Arc<DynamicImage> {
+    const TOLERANCE: i32 = 12;
+    const MAX_FRACTION: u32 = 6;
+    const MIN_TRIM: u32 = 4;
+
+    let rgb = image.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    if width < 32 || height < 32 {
+        return Arc::new(image.clone());
+    }
+
+    let border = rgb.get_pixel(0, 0).0;
+    let uniform = |px: &[u8; 3]| {
+        px.iter()
+            .zip(border.iter())
+            .all(|(a, b)| (*a as i32 - *b as i32).abs() <= TOLERANCE)
+    };
+    // Sampling rather than reading every pixel: a margin is uniform across its
+    // whole run, so every eighth pixel is enough to tell.
+    let step = 8;
+
+    let row_blank = |y: u32| (0..width).step_by(step).all(|x| uniform(&rgb.get_pixel(x, y).0));
+    let col_blank = |x: u32| (0..height).step_by(step).all(|y| uniform(&rgb.get_pixel(x, y).0));
+
+    let limit_y = height / MAX_FRACTION;
+    let limit_x = width / MAX_FRACTION;
+
+    let top = (0..limit_y).take_while(|y| row_blank(*y)).count() as u32;
+    let bottom = (0..limit_y).take_while(|i| row_blank(height - 1 - i)).count() as u32;
+    let left = (0..limit_x).take_while(|x| col_blank(*x)).count() as u32;
+    let right = (0..limit_x).take_while(|i| col_blank(width - 1 - i)).count() as u32;
+
+    // Every side running to its limit means the page is uniform throughout —
+    // a blank or solid-colour page — and there is no margin to distinguish
+    // from content. Trimming it would eat the page itself.
+    if top >= limit_y && bottom >= limit_y && left >= limit_x && right >= limit_x {
+        return Arc::new(image.clone());
+    }
+
+    let (top, bottom) = (drop_small(top), drop_small(bottom));
+    let (left, right) = (drop_small(left), drop_small(right));
+    if top + bottom + left + right == 0 {
+        return Arc::new(image.clone());
+    }
+
+    let new_w = width.saturating_sub(left + right).max(MIN_TRIM);
+    let new_h = height.saturating_sub(top + bottom).max(MIN_TRIM);
+    Arc::new(image.crop_imm(left, top, new_w, new_h))
+}
+
+/// A one or two pixel edge is noise, not a margin.
+fn drop_small(n: u32) -> u32 {
+    if n > 2 { n } else { 0 }
+}
+
 /// One slice of one page, placed in the strip window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cut {
@@ -81,6 +157,21 @@ pub struct Reader {
     pub epoch: u64,
     /// Width every strip slice is normalised to, taken from the first one.
     strip_width: Option<u32>,
+    /// Crop uniform borders off each page. Most scans carry a few percent of
+    /// dead margin, and on a full-width pane that is a visible amount of lost
+    /// artwork.
+    pub trim_margins: bool,
+    /// Percentage brightness applied when composing. White-background manga in
+    /// a dark room is unpleasant, and the terminal theme cannot help because
+    /// the page is an image.
+    pub brightness: u8,
+    /// Set once the reader has chosen a view mode for itself, or the reader has
+    /// been told explicitly, so a later page cannot override the choice.
+    mode_locked: bool,
+    /// Height of the last composed window, in source pixels. Paging by a fixed
+    /// number of pixels ignores how big the window actually is. A `Cell`
+    /// because composing takes `&self`.
+    view_h: std::cell::Cell<u32>,
     /// Height of each slice, the estimate until its image arrives and the
     /// real value thereafter. Kept separately from `images` so that evicting
     /// an image cannot make its height unknown again: absolute positions are
@@ -129,6 +220,10 @@ impl Reader {
             pending_chapter: false,
             epoch: 0,
             strip_width: None,
+            trim_margins: true,
+            brightness: 100,
+            mode_locked: false,
+            view_h: std::cell::Cell::new(0),
             heights: Vec::new(),
             images: HashMap::new(),
             idx: 0,
@@ -202,11 +297,32 @@ impl Reader {
         (self.idx + PREFETCH_AHEAD >= self.pages.len().saturating_sub(1)).then_some(next)
     }
 
+    /// Forget every decoded page, so they are rebuilt under new settings.
+    pub fn drop_images(&mut self) {
+        self.images.clear();
+        self.strip_width = None;
+        self.invalidate();
+    }
+
     pub fn invalidate(&mut self) {
         self.key = None;
     }
 
     pub fn insert_image(&mut self, idx: usize, img: Arc<DynamicImage>) {
+        // Dead border first, so the width everything is normalised to is the
+        // width of actual artwork rather than of somebody's scanner bed.
+        let img = if self.trim_margins { trim(&img) } else { img };
+
+        // A page far taller than it is wide is a webtoon slice, whatever the
+        // source claimed. Decided from the first page only, and never against
+        // an explicit choice.
+        if idx == 0 && !self.mode_locked {
+            if img.height() > img.width().saturating_mul(2) {
+                self.mode = ViewMode::Strip;
+            }
+            self.mode_locked = true;
+        }
+
         // Normalise every slice to the width of the first one.
         //
         // The strip canvas is as wide as whatever slice is at the top of the
@@ -271,7 +387,17 @@ impl Reader {
             .retain(|i, _| i.abs_diff(idx) <= PREFETCH_AHEAD + PREFETCH_BEHIND + 2);
     }
 
+    /// One screen, less a sliver, so the line being read is not lost over the
+    /// fold. Falls back to a sane constant before anything has been composed.
+    pub fn page_step(&self) -> i64 {
+        match self.view_h.get() {
+            0 => 600,
+            h => (h as i64 * 9 / 10).max(120),
+        }
+    }
+
     pub fn toggle_mode(&mut self) {
+        self.mode_locked = true;
         self.mode = match self.mode {
             ViewMode::Paged => ViewMode::Strip,
             ViewMode::Strip => {
@@ -531,10 +657,11 @@ impl Reader {
             // Deliberately opaque RGB, no alpha channel: the iTerm2 encoder
             // only erases the pane before drawing when an image can be seen
             // through, and that erase is what makes every redraw flash.
-            ViewMode::Paged => self
-                .images
-                .get(&self.idx)
-                .map(|i| DynamicImage::ImageRgb8(i.to_rgb8())),
+            ViewMode::Paged => self.images.get(&self.idx).map(|i| {
+                let mut out = i.to_rgb8();
+                dim(&mut out, self.brightness);
+                DynamicImage::ImageRgb8(out)
+            }),
             ViewMode::Strip => {
                 let area_w = area.width as u32 * cell_w.max(1) as u32;
                 let area_h = area.height as u32 * cell_h.max(1) as u32;
@@ -589,6 +716,7 @@ impl Reader {
         let view_h = ((area_h as u64 * canvas_w as u64) / area_w.max(1) as u64).max(1) as u32;
         // Guard against a pathological pane aspect asking for a gigantic canvas.
         let view_h = view_h.min(20_000);
+        self.view_h.set(view_h);
 
         // Same colour the pane is filled with, so any uncovered strip blends in
         // rather than reading as a dark seam between pages.
@@ -608,9 +736,9 @@ impl Reader {
 
         // Dropped to RGB for the same reason as the paged branch: an opaque
         // image lets the encoder skip its erase-then-paint, which is the flash.
-        Some(DynamicImage::ImageRgb8(
-            DynamicImage::ImageRgba8(canvas).into_rgb8(),
-        ))
+        let mut out = DynamicImage::ImageRgba8(canvas).into_rgb8();
+        dim(&mut out, self.brightness);
+        Some(DynamicImage::ImageRgb8(out))
     }
 
     /// 0.0..=1.0 through the chapter, for the progress bar.
