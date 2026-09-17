@@ -21,6 +21,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Reader => reader(f, app),
         Screen::Settings => settings(f, app),
     }
+    if app.show_sources {
+        sources(f, app);
+    }
     if app.show_help {
         help(f, app);
     }
@@ -188,7 +191,7 @@ fn home(f: &mut Frame, app: &mut App) {
     );
 
     sidebar(f, app, side);
-    status_bar(f, app, bottom, "/ search · a all sources · ⏎ open · s save · l library · tab source · , settings · ? help");
+    status_bar(f, app, bottom, "/ search · a all sources · ⏎ open · s save · l library · tab sources · , settings · ? help");
 }
 
 /// Cover art plus metadata for whatever is highlighted.
@@ -547,6 +550,52 @@ fn settings(f: &mut Frame, app: &mut App) {
     status_bar(f, app, bottom, "space toggle · j/k move · esc back");
 }
 
+
+/// The source picker, over whatever screen is underneath.
+///
+/// Stepping through twenty plugins one `tab` at a time, re-running a search on
+/// each, is not a way to find the one that has a title. This shows them all at
+/// once, with what is switched off and where you are now.
+fn sources(f: &mut Frame, app: &App) {
+    let names = app.registry.names();
+    let height = (names.len() as u16 + 4).min(f.area().height.saturating_sub(2));
+    let area = centered(f.area(), 54, height);
+    f.render_widget(Clear, area);
+
+    let rows: Vec<ListItem> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let enabled = app.is_enabled(name);
+            let current = i == app.source_idx;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if current { " ▸ " } else { "   " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(
+                    if enabled { "[x] " } else { "[ ] " },
+                    Style::new().fg(if enabled { GOOD } else { MUTED }),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::new().fg(if enabled { TEXT } else { MUTED }),
+                ),
+            ]))
+        })
+        .collect();
+
+    let mut st = ListState::default().with_selected(Some(app.source_sel));
+    f.render_stateful_widget(
+        List::new(rows)
+            .block(frame("sources · ⏎ use · space on/off · a search all · esc"))
+            .highlight_style(Style::new().fg(ACCENT).bg(SEL).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌"),
+        area,
+        &mut st,
+    );
+}
+
 fn help(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 64, 22);
     f.render_widget(Clear, area);
@@ -555,7 +604,7 @@ fn help(f: &mut Frame, app: &App) {
         Line::from(Span::styled("keys", Style::new().fg(ACCENT).bold())),
         Line::raw(""),
         key_line("/", "search the current source"),
-        key_line("tab", "cycle source (built-in + TOML plugins)"),
+        key_line("tab", "open the source picker"),
         key_line("a", "search every enabled source at once"),
         key_line("l", "switch between search results and library"),
         key_line("s", "add/remove from library"),

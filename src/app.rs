@@ -144,6 +144,9 @@ pub struct App {
     /// True when results are merged from every source, which is when a row
     /// needs to say where it came from.
     pub multi_source: bool,
+    /// The source picker, shown over whatever screen is underneath.
+    pub show_sources: bool,
+    pub source_sel: usize,
     pub detail: Option<Detail>,
     pub reader: Option<Reader>,
     pub settings_sel: usize,
@@ -198,6 +201,8 @@ impl App {
             search_id: 0,
             searches_pending: 0,
             multi_source: false,
+            show_sources: false,
+            source_sel: 0,
             detail: None,
             reader: None,
             settings_sel: 0,
@@ -278,6 +283,59 @@ impl App {
             }
         }
         self.status = "every source is disabled — press , for settings".into();
+    }
+
+
+    fn sources_key(&mut self, key: KeyEvent) {
+        let len = self.registry.sources.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => self.show_sources = false,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.source_sel = (self.source_sel + 1).min(len.saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.source_sel = self.source_sel.saturating_sub(1)
+            }
+            KeyCode::Char('g') => self.source_sel = 0,
+            KeyCode::Char('G') => self.source_sel = len.saturating_sub(1),
+            KeyCode::Char(' ') => self.toggle_selected_source(),
+            KeyCode::Char('a') => {
+                self.show_sources = false;
+                self.search_all();
+            }
+            KeyCode::Enter => self.choose_selected_source(),
+            _ => {}
+        }
+    }
+
+    fn toggle_selected_source(&mut self) {
+        let Some(name) = self.registry.names().get(self.source_sel).cloned() else {
+            return;
+        };
+        match self.state.disabled_sources.iter().position(|d| *d == name) {
+            Some(i) => {
+                self.state.disabled_sources.remove(i);
+            }
+            None => self.state.disabled_sources.push(name),
+        }
+        self.state.save();
+    }
+
+    /// Switch to the highlighted source and search it.
+    fn choose_selected_source(&mut self) {
+        let Some(name) = self.registry.names().get(self.source_sel).cloned() else {
+            return;
+        };
+        // Picking a source you had switched off plainly means you want it.
+        if let Some(i) = self.state.disabled_sources.iter().position(|d| *d == name) {
+            self.state.disabled_sources.remove(i);
+        }
+
+        self.source_idx = self.source_sel;
+        self.state.last_source = Some(name);
+        self.state.save();
+        self.show_sources = false;
+        self.search();
     }
 
     pub fn settings_items(&self) -> Vec<SettingItem> {
@@ -746,6 +804,10 @@ impl App {
             self.show_help = false;
             return;
         }
+        if self.show_sources {
+            self.sources_key(key);
+            return;
+        }
 
         match self.screen {
             Screen::Home => self.home_key(key),
@@ -815,7 +877,10 @@ impl App {
                 KeyCode::Esc => self.editing = false,
                 // Also handled here: the search box otherwise swallows it, and
                 // switching source mid-query is a reasonable thing to want.
-                KeyCode::Tab => self.cycle_source(),
+                KeyCode::Tab => {
+                self.show_sources = true;
+                self.source_sel = self.source_idx;
+            }
                 KeyCode::Enter => {
                     self.editing = false;
                     self.search();
@@ -841,7 +906,10 @@ impl App {
                 self.editing = true;
                 self.query.clear();
             }
-            KeyCode::Tab => self.cycle_source(),
+            KeyCode::Tab => {
+                self.show_sources = true;
+                self.source_sel = self.source_idx;
+            }
             KeyCode::Char('L') | KeyCode::Char('l') => {
                 self.tab = match self.tab {
                     HomeTab::Search => HomeTab::Library,
