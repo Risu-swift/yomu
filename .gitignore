@@ -1,0 +1,13 @@
+/target
+
+# Source plugins stay local.
+#
+# A plugin is a pointer at one specific site, chosen by whoever runs the app.
+# It is configuration rather than part of the program, and which sites are
+# acceptable to fetch from is not a decision this repository makes for anyone.
+# Only the documented example is tracked, and the build needs that one.
+/sources/*
+!/sources/example.toml.sample
+
+# Generated test asset.
+/tools/test.png

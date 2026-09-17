@@ -1,0 +1,29 @@
+[package]
+name = "yomu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+directories = "6.0.0"
+futures = "0.3.34"
+image = "0.25.10"
+ratatui = "0.30.2"
+ratatui-image = { version = "11.0.8", default-features = false, features = ["image-defaults", "crossterm", "tokio"] }
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "gzip", "http2", "query", "system-proxy"] }
+scraper = "0.27.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+toml = "1.1.6"
+unicode-width = "0.2.2"
+
+# Local fork of ratatui-image with one change: its iTerm2 encoder erases the
+# pane before painting every image, which makes each redraw flash. The erase
+# only matters for images that can be seen through, so it is now skipped for
+# opaque ones. Revert by deleting this section and the vendor/ directory.
+[patch.crates-io]
+ratatui-image = { path = "vendor/ratatui-image" }

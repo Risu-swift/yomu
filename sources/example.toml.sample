@@ -1,0 +1,67 @@
+# yomu source plugin — copy to `example.toml` and edit to enable it.
+#
+# Everything here is a CSS selector, written one of three ways:
+#
+#   "h3 a"        text of the first match
+#   "h3 a@href"   an attribute of the first match
+#   "@data-id"    an attribute of the matched item itself
+#
+# Relative links are resolved against `base`, so "/manga/1" and
+# "//cdn.example/x.png" both work. Bad selectors are reported at startup
+# rather than failing silently mid-search.
+#
+# Point this at a site whose terms permit it. Nothing here ships enabled.
+
+name = "Example"
+base = "https://example.test"
+
+# "vertical" for webtoons/manhwa (continuous strip), "rtl" for manga,
+# "ltr" for western comics. Sets the reader's default view mode.
+direction = "vertical"
+
+# Optional. Sent with every request — most image CDNs want a Referer.
+[headers]
+Referer = "https://example.test/"
+
+[search]
+# {query} is substituted, url-encoded.
+url = "/search?q={query}"
+item = ".manga-card"
+title = "h3 a"
+link = "h3 a@href"
+cover = "img@data-src"          # optional
+# description = ".summary"      # optional
+
+[chapters]
+# Optional. Defaults to the series URL found by the search above.
+# Use {manga} where the series URL should go.
+# url = "{manga}/chapters"
+item = "#chapter-list li"
+link = "a@href"
+number = ".chapter-number"       # optional, defaults to "?"
+title = ".chapter-title"         # optional
+# Most sites list newest chapter first; true flips them into reading order.
+reverse = true
+
+[pages]
+# Optional. Defaults to the chapter URL. Use {chapter}.
+# url = "{chapter}?style=list"
+item = "#viewer img@src"
+
+# When the reader is JavaScript there is no <img> to select: the page list is
+# a variable in a script tag. Use `regex` over the raw HTML instead of `item`
+# — capture group 1 holds the URLs, and `split` cuts one capture into several.
+# regex = 'var chapImages\s*=\s*"([^"]+)"'
+# split = ","
+
+# Optional. What the settings screen's adult-content toggle does on this site.
+# One of these is substituted for {nsfw} anywhere in a URL template above —
+# `off` is used unless the toggle is deliberately turned on. Leave the whole
+# section out when the site has no such parameter: the toggle then reports
+# itself as inapplicable here instead of pretending to work.
+#
+#   url = "/search?q={query}{nsfw}"
+#
+# [nsfw]
+# on = ""
+# off = "&rating=safe"
