@@ -11,6 +11,44 @@ use serde::{Deserialize, Serialize};
 use crate::model::MangaRef;
 use crate::net::config_dir;
 
+/// How much chrome the reader shows around the page.
+///
+/// Every row spent on a bar is a row not spent on artwork, so this is worth
+/// having under the reader's thumb rather than fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Chrome {
+    /// Title bar, a progress gauge, and a second line naming the chapter.
+    Full,
+    /// Title bar and a single combined line.
+    Compact,
+    /// Nothing but the page, except when something needs saying.
+    Hidden,
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Self::Compact
+    }
+}
+
+impl Chrome {
+    pub fn next(self) -> Self {
+        match self {
+            Chrome::Full => Chrome::Compact,
+            Chrome::Compact => Chrome::Hidden,
+            Chrome::Hidden => Chrome::Full,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Chrome::Full => "full",
+            Chrome::Compact => "compact",
+            Chrome::Hidden => "hidden",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
     pub chapter_id: String,
@@ -39,6 +77,10 @@ pub struct State {
     /// plugins being added, removed or reordered.
     #[serde(default)]
     pub disabled_sources: Vec<String>,
+    /// How much chrome the reader draws. Remembered between sessions, since it
+    /// is a reading preference rather than a per-session choice.
+    #[serde(default)]
+    pub chrome: Chrome,
 }
 
 fn path() -> PathBuf {

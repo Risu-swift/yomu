@@ -21,7 +21,11 @@ use crate::source::Registry;
 use crate::state::{Progress, State};
 
 pub enum Msg {
-    Results(Vec<MangaRef>),
+    /// Search hits: which search they answer, which source produced them,
+    /// and the hits themselves. The id lets results from a superseded query
+    /// be dropped, which matters when a dozen sources answer at their own
+    /// pace and a new search starts before the slow ones reply.
+    Results(u64, String, Vec<MangaRef>),
     Chapters(String, Chapters),
     /// Pages for one chapter: its index, and whether to continue the current
     /// read or replace it.
@@ -59,6 +63,13 @@ pub enum HomeTab {
     Search,
     Library,
 }
+
+/// How many reader frames may encode at once.
+///
+/// Two is the useful depth: the next frame builds while the current one is
+/// displayed, so the visible frame rate stops being bounded by a single
+/// encode. More than that only queues work the scroll will outrun.
+const MAX_ENCODES_IN_FLIGHT: usize = 2;
 
 /// How images are scaled into their pane.
 ///
@@ -125,6 +136,14 @@ pub struct App {
     pub editing: bool,
     pub results: Vec<MangaRef>,
     pub sel: usize,
+    /// Identifies the current search, so stragglers from an older one are
+    /// ignored rather than appended.
+    search_id: u64,
+    /// Sources still to answer the current search.
+    searches_pending: usize,
+    /// True when results are merged from every source, which is when a row
+    /// needs to say where it came from.
+    pub multi_source: bool,
     pub detail: Option<Detail>,
     pub reader: Option<Reader>,
     pub settings_sel: usize,
@@ -146,10 +165,12 @@ pub struct App {
     /// driven from the event loop without duplicating the layout here.
     pub reader_area: Rect,
     pub cover_area: Rect,
-    /// At most one reader frame encodes at a time. Without this, holding a
-    /// scroll key queues an encode per repeat, the blocking pool falls minutes
-    /// behind the input, and the view only catches up on key release.
-    reader_encoding: bool,
+    /// Reader frames currently encoding. Capped rather than serialised: one
+    /// at a time makes the frame rate exactly the encode time, while an
+    /// unbounded queue lets a held key run the blocking pool minutes behind
+    /// the input. Two overlap, so the next frame is already being built
+    /// while the current one is on screen.
+    reader_encoding: usize,
 
     pub tx: UnboundedSender<Msg>,
 }
@@ -174,6 +195,9 @@ impl App {
             editing: false,
             results: Vec::new(),
             sel: 0,
+            search_id: 0,
+            searches_pending: 0,
+            multi_source: false,
             detail: None,
             reader: None,
             settings_sel: 0,
@@ -190,7 +214,7 @@ impl App {
             inflight_covers: HashSet::new(),
             reader_area: Rect::ZERO,
             cover_area: Rect::ZERO,
-            reader_encoding: false,
+            reader_encoding: 0,
             tx,
         };
 
@@ -282,18 +306,65 @@ impl App {
             return;
         };
         let q = self.query.clone();
-        let tx = self.tx.clone();
-        self.busy = true;
+        self.begin_search(false);
         self.status = if q.is_empty() {
             format!("browsing {}", src.name())
         } else {
             format!("searching {} for {q}", src.name())
         };
+        self.dispatch_search(src, q);
+    }
 
+    /// Query every enabled source at once and merge what comes back.
+    ///
+    /// Cycling sources one at a time is fine with two of them and useless with
+    /// twenty, particularly when most will not carry a given title.
+    pub fn search_all(&mut self) {
+        let sources: Vec<_> = self
+            .registry
+            .sources
+            .iter()
+            .filter(|s| self.is_enabled(s.name()))
+            .cloned()
+            .collect();
+
+        if sources.is_empty() {
+            self.status = "every source is disabled — press , for settings".into();
+            return;
+        }
+
+        let q = self.query.clone();
+        self.begin_search(true);
+        self.searches_pending = sources.len();
+        self.status = format!("searching {} sources…", sources.len());
+
+        for src in sources {
+            self.dispatch_search(src, q.clone());
+        }
+    }
+
+    fn begin_search(&mut self, multi: bool) {
+        self.search_id = self.search_id.wrapping_add(1);
+        self.searches_pending = 1;
+        self.multi_source = multi;
+        self.results.clear();
+        self.sel = 0;
+        self.busy = true;
+    }
+
+    fn dispatch_search(&self, src: std::sync::Arc<dyn crate::source::Source>, query: String) {
+        let tx = self.tx.clone();
+        let id = self.search_id;
+        let name = src.name().to_string();
         tokio::spawn(async move {
-            let msg = match src.search(&q).await {
-                Ok(r) => Msg::Results(r),
-                Err(e) => Msg::Error(format!("search failed: {e:#}")),
+            let msg = match src.search(&query).await {
+                Ok(r) => Msg::Results(id, name, r),
+                // A single source failing should not abort a merged search, so
+                // it reports empty and the status line counts it as answered.
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{name}: {e:#}")));
+                    Msg::Results(id, String::new(), Vec::new())
+                }
             };
             let _ = tx.send(msg);
         });
@@ -480,7 +551,7 @@ impl App {
 
     fn refresh_reader_image(&mut self) {
         let area = self.reader_area;
-        if self.reader_encoding || self.screen != Screen::Reader {
+        if self.reader_encoding >= MAX_ENCODES_IN_FLIGHT || self.screen != Screen::Reader {
             return;
         }
         if area.width == 0 || area.height == 0 {
@@ -499,7 +570,7 @@ impl App {
         let fast = reader.is_animating();
         reader.encoded_fast = fast;
 
-        self.reader_encoding = true;
+        self.reader_encoding += 1;
         spawn_encode(picker, self.tx.clone(), image, area, fast, move |p| {
             Msg::Encoded(generation, p)
         });
@@ -532,11 +603,31 @@ impl App {
 
     pub fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Results(r) => {
-                self.busy = false;
-                self.status = format!("{} results", r.len());
-                self.results = r;
-                self.sel = 0;
+            Msg::Results(id, _source, hits) => {
+                // Answers to a search that has since been replaced.
+                if id != self.search_id {
+                    return;
+                }
+
+                self.results.extend(hits);
+                self.searches_pending = self.searches_pending.saturating_sub(1);
+                self.busy = self.searches_pending > 0;
+
+                if self.multi_source {
+                    // Grouped by source so a merged list reads as sections
+                    // rather than in whatever order the network replied.
+                    self.results.sort_by(|a, b| {
+                        a.source.cmp(&b.source).then_with(|| a.title.cmp(&b.title))
+                    });
+                    self.status = if self.busy {
+                        format!("{} results · {} sources left", self.results.len(), self.searches_pending)
+                    } else {
+                        format!("{} results from every source", self.results.len())
+                    };
+                } else {
+                    self.status = format!("{} results", self.results.len());
+                }
+
                 self.tab = HomeTab::Search;
                 self.cover_key = None;
                 self.ensure_cover();
@@ -625,7 +716,7 @@ impl App {
                 self.status = e;
             }
             Msg::Encoded(generation, protocol) => {
-                self.reader_encoding = false;
+                self.reader_encoding = self.reader_encoding.saturating_sub(1);
                 match protocol {
                     Some(p) => {
                         if let Some(reader) = &mut self.reader {
@@ -745,6 +836,7 @@ impl App {
                 self.screen = Screen::Settings;
                 self.settings_sel = 0;
             }
+            KeyCode::Char('a') => self.search_all(),
             KeyCode::Char('/') => {
                 self.editing = true;
                 self.query.clear();
@@ -868,6 +960,17 @@ impl App {
                 self.refresh_cover_proto();
             }
             KeyCode::Char('v') => reader.toggle_mode(),
+            KeyCode::Char('f') => {
+                // Fewer bars means more rows of artwork, so this is worth
+                // having on a key rather than fixed.
+                self.state.chrome = self.state.chrome.next();
+                self.state.save();
+                self.status = format!("bars: {}", self.state.chrome.label());
+                // The pane just changed height, so the encoded frame is stale.
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.invalidate();
+                }
+            }
             KeyCode::Char('n') => self.change_chapter(1),
             KeyCode::Char('p') => self.change_chapter(-1),
             KeyCode::Char('g') => {

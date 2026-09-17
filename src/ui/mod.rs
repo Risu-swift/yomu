@@ -11,6 +11,7 @@ use ratatui_image::Image;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, HomeTab, Screen, SettingItem};
+use crate::state::Chrome;
 use theme::*;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -160,10 +161,17 @@ fn home(f: &mut Frame, app: &mut App) {
                 .progress_of(m)
                 .map(|p| format!("  ch.{}", p.chapter_number))
                 .unwrap_or_default();
+            // Which source a hit came from only matters once they are mixed.
+            let origin = if app.multi_source {
+                format!("  [{}]", m.source)
+            } else {
+                String::new()
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(saved, Style::new().fg(WARN)),
                 Span::styled(m.title.clone(), Style::new().fg(TEXT)),
                 Span::styled(progress, Style::new().fg(MUTED)),
+                Span::styled(origin, Style::new().fg(ACCENT2)),
             ]))
         })
         .collect();
@@ -180,7 +188,7 @@ fn home(f: &mut Frame, app: &mut App) {
     );
 
     sidebar(f, app, side);
-    status_bar(f, app, bottom, "/ search · ⏎ open · s save · l library · tab source · ? help · q quit");
+    status_bar(f, app, bottom, "/ search · a all sources · ⏎ open · s save · l library · tab source · , settings · ? help");
 }
 
 /// Cover art plus metadata for whatever is highlighted.
@@ -322,9 +330,29 @@ fn detail(f: &mut Frame, app: &mut App) {
 }
 
 fn reader(f: &mut Frame, app: &mut App) {
-    let [top, body, bottom] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-            .areas(f.area());
+    let chrome_mode = app.state.chrome;
+
+    // Anything the reader is waiting on has to be visible even when the bars
+    // are hidden, or the app looks frozen with no way to tell why.
+    let attention = app.busy
+        || app
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.waiting_for_pages() || r.protocol.is_none());
+
+    let title_h = u16::from(chrome_mode != Chrome::Hidden);
+    let footer_h = match chrome_mode {
+        Chrome::Full => 2,
+        Chrome::Compact => 1,
+        Chrome::Hidden => u16::from(attention),
+    };
+
+    let [top, body, bottom] = Layout::vertical([
+        Constraint::Length(title_h),
+        Constraint::Min(0),
+        Constraint::Length(footer_h),
+    ])
+    .areas(f.area());
 
     // Recorded before borrowing the reader, so the event loop can encode for
     // this exact size after the draw completes.
@@ -338,6 +366,10 @@ fn reader(f: &mut Frame, app: &mut App) {
         Some(c) => format!("{} · {}", reader.manga.title, c.label()),
         None => reader.manga.title.clone(),
     };
+    let chapter_label = reader
+        .chapter_ref()
+        .map(|c| c.label())
+        .unwrap_or_else(|| reader.manga.title.clone());
     // Chapter-relative: a continuous read appends chapters onto the page list,
     // so a raw index would climb past the end of the chapter being read.
     let (page, pages) = reader.chapter_span();
@@ -372,43 +404,91 @@ fn reader(f: &mut Frame, app: &mut App) {
         );
     }
 
-    chrome(f, app, top, &header);
+    if title_h > 0 {
+        chrome(f, app, top, &header);
+    }
+    if footer_h == 0 {
+        return;
+    }
+
+    let position = format!(
+        " {}/{} · {mode}{} ",
+        (page + 1).min(pages.max(1)),
+        pages.max(1),
+        // Scrolling stops at the last page that has arrived, so say so rather
+        // than letting it look frozen.
+        if waiting { " · loading" } else { "" },
+    );
+
+    // One row in the hidden case: just enough to explain the pause.
+    if chrome_mode == Chrome::Hidden {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit(&format!(" {}", app.status), bottom.width as usize),
+                Style::new().fg(MUTED),
+            )))
+            .style(Style::new().bg(BAR)),
+            bottom,
+        );
+        return;
+    }
+
+    let [gauge_row, label_row] = match chrome_mode {
+        Chrome::Full => {
+            let [a, b] =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(bottom);
+            [a, b]
+        }
+        _ => [bottom, Rect::ZERO],
+    };
 
     // Drop hints progressively rather than letting them be cut mid-word.
     let hints = [
-        "j/k scroll · space page · n/p chapter · v mode · esc back ",
-        "j/k · space · n/p · v · esc ",
+        "j/k scroll · space page · n/p chapter · v mode · f bars · esc back ",
+        "j/k · space · n/p · v · f · esc ",
         "",
     ]
     .into_iter()
     .find(|h| h.width() as u16 + 24 <= bottom.width)
     .unwrap_or("");
 
-    let (gauge_area, keys_area) = split_bar(bottom, hints);
+    // Compact shares one row with the hints; full gives the gauge the row.
+    let gauge_area = if chrome_mode == Chrome::Full {
+        gauge_row
+    } else {
+        split_bar(gauge_row, hints).0
+    };
 
     f.render_widget(
         LineGauge::default()
             .filled_style(Style::new().fg(ACCENT))
             .unfilled_style(Style::new().fg(BORDER))
-            .label(Span::styled(
-                format!(
-                    " {}/{} · {mode}{} ",
-                    (page + 1).min(pages.max(1)),
-                    pages.max(1),
-                    // Scrolling stops at the last page that has arrived, so say
-                    // so rather than letting it look frozen.
-                    if waiting { " · loading" } else { "" },
-                ),
-                Style::new().fg(MUTED),
-            ))
+            .label(Span::styled(position, Style::new().fg(MUTED)))
             .ratio(fraction),
         gauge_area,
     );
+
+    let hint_area = if chrome_mode == Chrome::Full {
+        // Second row: what is being read on the left, keys on the right.
+        let (left, right) = split_bar(label_row, hints);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit(&format!(" {chapter_label}"), left.width as usize),
+                Style::new().fg(TEXT),
+            )))
+            .style(Style::new().bg(BAR)),
+            left,
+        );
+        right
+    } else {
+        split_bar(gauge_row, hints).1
+    };
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hints, Style::new().fg(MUTED))))
             .alignment(Alignment::Right)
             .style(Style::new().bg(BAR)),
-        keys_area,
+        hint_area,
     );
 }
 
@@ -476,6 +556,7 @@ fn help(f: &mut Frame, app: &App) {
         Line::raw(""),
         key_line("/", "search the current source"),
         key_line("tab", "cycle source (built-in + TOML plugins)"),
+        key_line("a", "search every enabled source at once"),
         key_line("l", "switch between search results and library"),
         key_line("s", "add/remove from library"),
         key_line("⏎", "open series · start reading"),
@@ -483,6 +564,8 @@ fn help(f: &mut Frame, app: &App) {
         key_line("space b", "page down / up"),
         key_line("n p", "next / previous chapter"),
         key_line("v", "toggle paged ↔ strip view"),
+        key_line("f", "reader bars: full ↔ compact ↔ hidden"),
+        key_line(",", "settings"),
         key_line("esc", "back · q quit"),
         Line::raw(""),
         Line::from(Span::styled(

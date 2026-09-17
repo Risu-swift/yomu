@@ -99,6 +99,10 @@ pub struct Reader {
     /// Bumped per encode request so late results from an abandoned scroll
     /// position can be discarded instead of snapping the view backwards.
     pub generation: u64,
+    /// Generation of the frame on screen. Encodes run concurrently and can
+    /// finish out of order, so a frame is only taken if it is newer than
+    /// what is already displayed.
+    displayed: u64,
     /// Where scrolling is heading, as an absolute pixel offset into the
     /// chapter. Keys move this; the view eases toward it on a clock, which is
     /// what turns a series of jumps into motion.
@@ -132,6 +136,7 @@ impl Reader {
             mode,
             protocol: None,
             generation: 0,
+            displayed: 0,
             target: 0,
             encoded_fast: false,
             key: None,
@@ -160,6 +165,8 @@ impl Reader {
         // A different chapter entirely, so holding the old frame would show the
         // wrong page rather than hide a flicker.
         self.protocol = None;
+        self.displayed = 0;
+        self.generation = 0;
         self.invalidate();
     }
 
@@ -507,9 +514,14 @@ impl Reader {
         Some((self.generation, composed))
     }
 
-    /// Accept a finished encode, ignoring one the view has already moved past.
+    /// Accept a finished encode, ignoring anything older than what is shown.
+    ///
+    /// Several encodes are allowed to be in flight at once, so they can land
+    /// out of order. Taking only the newest keeps the view moving forward
+    /// without ever stepping back to a frame that has been superseded.
     pub fn accept(&mut self, generation: u64, protocol: Protocol) {
-        if generation == self.generation {
+        if generation > self.displayed {
+            self.displayed = generation;
             self.protocol = Some(protocol);
         }
     }
